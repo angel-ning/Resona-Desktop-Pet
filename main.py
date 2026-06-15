@@ -20,6 +20,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from resona_desktop_pet.config import ConfigManager
 from resona_desktop_pet.backend import LLMBackend, TTSBackend, MCPManager
+from resona_desktop_pet.agent_os.runtime import AgentRuntime
 from resona_desktop_pet.backend.sovits_manager import SoVITSManager
 from resona_desktop_pet.ui.luna.main_window import MainWindow
 from resona_desktop_pet.ui.tray_icon import TrayIcon
@@ -502,6 +503,11 @@ class ApplicationController(QObject):
         self.llm_backend = LLMBackend(self.config, log_path=llm_log_path, mcp_manager=self.mcp_manager)
         if self.memory_manager:
             self.llm_backend._memory_manager = self.memory_manager
+        self.agent_runtime = AgentRuntime(
+            self.config,
+            self.llm_backend,
+            mcp_manager=self.mcp_manager,
+        )
         
         self._current_watchdog_interval = 300000  
         def reset_watchdog():
@@ -523,6 +529,7 @@ class ApplicationController(QObject):
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._run_loop, daemon=True)
         self._loop_thread.start()
+        self.agent_runtime.event_sink = self._handle_agent_event
         
         if self.config.sovits_enabled and self.config.sovits_mode == "server":
             logger.info(f"[Main] SoVITS server mode: connecting to {self.config.sovits_server_host}:{self.config.sovits_server_port}")
@@ -826,7 +833,13 @@ class ApplicationController(QObject):
 
         try:
             source = session.client_type if hasattr(session, "client_type") and session.client_type else "web_client"
-            response = await self.llm_backend.query(text, history=session.history, pack_id=current_pack_id, source=source)
+            response = await self.agent_runtime.query_text(
+                text,
+                history=session.history,
+                pack_id=current_pack_id,
+                source=source,
+                session_id=session.session_id,
+            )
             
             stop_thinking_event.set()
             if not rotation_task.done():
@@ -891,6 +904,97 @@ class ApplicationController(QObject):
             QTimer.singleShot(0, self.main_window.finish_processing)
         else:
             self.main_window.finish_processing()
+
+    async def handle_agent_console_query(self, text: str, session: ClientSession):
+        if not text.strip():
+            return
+        session.touch()
+        operator_pack_id = "Resona_Operator"
+        session.pack_id = operator_pack_id
+        session.client_type = "agent_console"
+
+        try:
+            await session.websocket.send_json({
+                "type": "agent_status",
+                "state": "running",
+                "message": "Agent task started.",
+            })
+            response = await self.agent_runtime.query_text(
+                text,
+                history=session.history,
+                pack_id=operator_pack_id,
+                source="agent_console",
+                session_id=session.session_id,
+            )
+            await self._send_agent_console_response(session, response)
+        except Exception as e:
+            await session.websocket.send_json({"type": "agent_error", "message": str(e)})
+            traceback.print_exc()
+        finally:
+            try:
+                await session.websocket.send_json({
+                    "type": "agent_status",
+                    "state": "idle",
+                    "message": "Agent ready.",
+                })
+            except Exception:
+                pass
+
+    async def handle_agent_console_tool_confirmation(self, session: ClientSession, confirmation_id: str, approved: bool):
+        session.touch()
+        try:
+            await session.websocket.send_json({
+                "type": "agent_status",
+                "state": "running",
+                "message": "Executing confirmed tool." if approved else "Cancelling tool call.",
+            })
+            response = await self.llm_backend.confirm_pending_tool(
+                session.session_id,
+                confirmation_id,
+                approved=approved,
+            )
+            await self._send_agent_console_response(session, response)
+        except Exception as e:
+            await session.websocket.send_json({"type": "agent_error", "message": str(e)})
+            traceback.print_exc()
+        finally:
+            try:
+                await session.websocket.send_json({
+                    "type": "agent_status",
+                    "state": "idle",
+                    "message": "Agent ready.",
+                })
+            except Exception:
+                pass
+
+    async def _send_agent_console_response(self, session: ClientSession, response):
+        for tool_result in getattr(response, "tool_results", []) or []:
+            await session.websocket.send_json({
+                "type": "tool_result",
+                "result": tool_result,
+            })
+
+        confirmation = getattr(response, "confirmation", None)
+        if confirmation:
+            await session.websocket.send_json({
+                "type": "confirmation_required",
+                "confirmation": confirmation,
+            })
+            return
+
+        if response.error:
+            await session.websocket.send_json({
+                "type": "agent_error",
+                "message": response.error,
+            })
+            return
+
+        await session.websocket.send_json({
+            "type": "agent_message",
+            "text": response.text_display,
+            "thought": response.thought,
+            "raw_response": response.raw_response,
+        })
 
     async def handle_web_settings_update(self, settings: dict, session: ClientSession):
         session.touch()
@@ -1079,7 +1183,11 @@ class ApplicationController(QObject):
         asyncio.run_coroutine_threadsafe(self._query_llm(text), self._loop)
     async def _query_llm(self, text: str):
         try:
-            response = await self.llm_backend.query(text, pack_id=self.config.pack_manager.active_pack_id, source="desktop")
+            response = await self.agent_runtime.query_text(
+                text,
+                pack_id=self.config.pack_manager.active_pack_id,
+                source="desktop",
+            )
             self.llm_response_ready.emit(response)
         except Exception as e:
             logger.error(f"[Main] LLM query failed: {e}")
@@ -1286,7 +1394,10 @@ class ApplicationController(QObject):
 
     async def _query_llm_idle(self, prompt: str):
         try:
-            response = await self.llm_backend.query_idle(prompt, pack_id=self.config.pack_manager.active_pack_id)
+            response = await self.agent_runtime.query_idle(
+                prompt,
+                pack_id=self.config.pack_manager.active_pack_id,
+            )
             self.llm_response_ready.emit(response)
         except Exception as e:
             logger.error(f"[Main] Idle LLM query failed: {e}")
@@ -1712,6 +1823,17 @@ class ApplicationController(QObject):
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
+
+    def _handle_agent_event(self, event):
+        try:
+            payload = {"type": "agent_event", "event": event.to_dict()}
+            if hasattr(self, "_loop") and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    session_manager.broadcast_all(payload),
+                    self._loop,
+                )
+        except Exception as e:
+            logger.debug(f"[AgentOS] Event broadcast skipped: {e}")
 
     async def _connect_remote_sovits(self):
         try:

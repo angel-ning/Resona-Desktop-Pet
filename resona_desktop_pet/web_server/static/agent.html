@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Resona Agent Console</title>
+    <link rel="stylesheet" href="/static/css/agent.css?v=20260615_1">
+</head>
+<body>
+    <main class="console-shell">
+        <header class="console-header">
+            <div>
+                <h1>Resona Agent Console</h1>
+                <p>Operator mode. Runtime policy remains the final tool gate.</p>
+            </div>
+            <div class="status-wrap">
+                <span id="status-dot" class="status-dot disconnected"></span>
+                <span id="status-text">Disconnected</span>
+            </div>
+        </header>
+
+        <section class="console-grid">
+            <section class="panel transcript-panel">
+                <div class="panel-title">Conversation</div>
+                <div id="transcript" class="scroll-log"></div>
+            </section>
+
+            <aside class="side-stack">
+                <section class="panel">
+                    <div class="panel-title">Runtime Events</div>
+                    <div id="events" class="scroll-log compact"></div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Tools</div>
+                    <div id="tools" class="scroll-log compact"></div>
+                </section>
+            </aside>
+        </section>
+
+        <section id="confirmation-panel" class="confirmation hidden"></section>
+
+        <footer class="composer">
+            <textarea id="agent-input" placeholder="Describe a task for Resona Operator..."></textarea>
+            <button id="send-btn">Send</button>
+        </footer>
+    </main>
+
+    <script src="/static/js/agent.js?v=20260615_1"></script>
+</body>
+</html>

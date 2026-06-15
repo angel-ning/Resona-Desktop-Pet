@@ -211,3 +211,13 @@ android-client/**/*.apk
 android-client/**/*.aab
 android-client/**/*.iml
 android-client/*.keystore
+
+
+memory
+models
+packs/*
+!packs/
+!packs/Resona_Operator/
+!packs/Resona_Operator/**
+runtime
+stt_model.tar.bz2

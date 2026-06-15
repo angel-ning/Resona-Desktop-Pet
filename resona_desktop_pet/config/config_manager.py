@@ -760,6 +760,10 @@ class ConfigManager:
         return self.get("MCP", "hide_public_prefixes", "sts_")
 
     @property
+    def skill_router_enabled(self) -> bool:
+        return self.getboolean("SkillRouter", "enabled", True)
+
+    @property
     def memory_enabled(self) -> bool:
         return self.getboolean("Memory", "enabled", True)
 
@@ -937,7 +941,7 @@ class ConfigManager:
 
             if target_val:
                 search_filename = target_val if target_val.endswith('.txt') else target_val + '.txt'
-                default_prompt_path = self.pack_manager.get_path("logic", "prompts")
+                default_prompt_path = self.pack_manager.get_path("logic", "prompts", pack_id=target_pack_id)
                 if default_prompt_path:
                     prompt_dir = default_prompt_path.parent
                     direct_path = prompt_dir / search_filename

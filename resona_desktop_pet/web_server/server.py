@@ -32,6 +32,7 @@ session_manager = SessionManager()
 controller_ref = None
 main_loop = None
 BEACON_PORT = 50123
+OPERATOR_PACK_ID = "Resona_Operator"
 
 def resolve_static_path(controller, static_dir: str) -> Path:
     project_root = Path(controller.project_root)
@@ -197,6 +198,9 @@ async def websocket_endpoint(websocket: WebSocket):
         sess_id = init_data.get("session_id")
         client_type = init_data.get("client_type", "web_app")
 
+        if client_type == "agent_console":
+            pack_id = OPERATOR_PACK_ID
+
         if (pack_id == "default" or not pack_id) and controller_ref:
             pack_id = controller_ref.config.pack_manager.active_pack_id
 
@@ -235,8 +239,30 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg_type == "text_input":
                 text = msg.get("text", "")
                 if text and controller_ref and main_loop:
+                    if session.client_type == "agent_console":
+                        asyncio.run_coroutine_threadsafe(
+                            controller_ref.handle_agent_console_query(text, session),
+                            main_loop
+                        )
+                    else:
+                        asyncio.run_coroutine_threadsafe(
+                            controller_ref.handle_web_query(text, session),
+                            main_loop
+                        )
+
+            elif msg_type == "confirm_tool":
+                confirmation_id = msg.get("confirmation_id", "")
+                if confirmation_id and controller_ref and main_loop:
                     asyncio.run_coroutine_threadsafe(
-                        controller_ref.handle_web_query(text, session),
+                        controller_ref.handle_agent_console_tool_confirmation(session, confirmation_id, True),
+                        main_loop
+                    )
+
+            elif msg_type == "reject_tool":
+                confirmation_id = msg.get("confirmation_id", "")
+                if confirmation_id and controller_ref and main_loop:
+                    asyncio.run_coroutine_threadsafe(
+                        controller_ref.handle_agent_console_tool_confirmation(session, confirmation_id, False),
                         main_loop
                     )
 
@@ -415,6 +441,58 @@ async def get_static_info():
         })
     return JSONResponse({"error": "Server not ready"}, status_code=503)
 
+@app.get("/agent")
+async def get_agent_console():
+    if controller_ref:
+        static_path = resolve_static_path(controller_ref, controller_ref.config.html_static_dir)
+        agent_path = static_path / "agent.html"
+        if agent_path.exists():
+            return FileResponse(agent_path, headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            })
+    return JSONResponse({"error": "Agent console not ready"}, status_code=503)
+
+@app.get("/agent_os/status")
+async def get_agent_os_status():
+    if not controller_ref or not getattr(controller_ref, "agent_runtime", None):
+        return JSONResponse({"error": "Agent runtime not ready"}, status_code=503)
+    runtime = controller_ref.agent_runtime
+    try:
+        pack = runtime.load_pack(controller_ref.config.pack_manager.active_pack_id)
+        return JSONResponse({
+            "status": "ok",
+            "active_pack": pack.folder_name,
+            "pack_id": pack.pack_id,
+            "persona": {
+                "name": pack.persona.name,
+                "tts_language": pack.persona.tts_language,
+                "outfits": pack.persona.outfits,
+            },
+            "skills": [skill.to_dict() for skill in pack.skills],
+            "tool_policy": pack.tool_policy.to_dict(),
+            "tool_providers": runtime.list_tool_providers(),
+        })
+    except Exception as e:
+        logger.error(f"[AgentOS] status failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/agent_os/pack")
+async def get_agent_os_pack(pack_id: Optional[str] = None):
+    if not controller_ref or not getattr(controller_ref, "agent_runtime", None):
+        return JSONResponse({"error": "Agent runtime not ready"}, status_code=503)
+    try:
+        pack = controller_ref.agent_runtime.load_pack(pack_id)
+        data = pack.to_dict()
+        if data.get("persona", {}).get("prompt_text"):
+            data["persona"]["prompt_text"] = data["persona"]["prompt_text"][:1000]
+            data["persona"]["prompt_text_truncated"] = True
+        return JSONResponse(data)
+    except Exception as e:
+        logger.error(f"[AgentOS] pack failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 @app.post("/__client_log")
 async def client_log(request: Request):
     try:
@@ -435,34 +513,41 @@ class WebServerThread(threading.Thread):
         self.daemon = True
 
     def run(self):
-        set_controller(self.controller, self.loop)
-        
-        static_path = resolve_static_path(self.controller, self.static_dir)
-        logger.debug(f"[Web] Static path: {static_path}")
-        start_udp_beacon(self.port)
-        
         try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            logger.info(f"\n[Web] Server is running! Access it from your phone at: http://{local_ip}:{self.port}\n")
-        except Exception:
-            logger.info(f"\n[Web] Server is running at: http://localhost:{self.port}\n")
+            set_controller(self.controller, self.loop)
+            
+            static_path = resolve_static_path(self.controller, self.static_dir)
+            logger.debug(f"[Web] Static path: {static_path}")
+            start_udp_beacon(self.port)
+            
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(0.2)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+                logger.info(f"\n[Web] Server is running! Access it from your phone at: http://{local_ip}:{self.port}\n")
+            except Exception:
+                logger.info(f"\n[Web] Server is running at: http://localhost:{self.port}\n")
 
-        packs_path = Path(self.controller.project_root) / "packs"
-        app.mount("/packs", StaticFiles(directory=str(packs_path)), name="packs")
-        
-        temp_path = Path(self.controller.project_root) / "TEMP"
-        temp_path.mkdir(parents=True, exist_ok=True)
-        app.mount("/temp", StaticFiles(directory=str(temp_path)), name="temp")
+            packs_path = Path(self.controller.project_root) / "packs"
+            if not any(getattr(route, "path", None) == "/packs" for route in app.routes):
+                app.mount("/packs", StaticFiles(directory=str(packs_path)), name="packs")
+            
+            temp_path = Path(self.controller.project_root) / "TEMP"
+            temp_path.mkdir(parents=True, exist_ok=True)
+            if not any(getattr(route, "path", None) == "/temp" for route in app.routes):
+                app.mount("/temp", StaticFiles(directory=str(temp_path)), name="temp")
 
-        app.mount("/static", StaticFiles(directory=str(static_path), html=True), name="static")
+            if not any(getattr(route, "path", None) == "/static" for route in app.routes):
+                app.mount("/static", StaticFiles(directory=str(static_path), html=True), name="static")
 
-        config = uvicorn.Config(app, host=self.host, port=self.port, log_level="error", log_config=None)
-        server = uvicorn.Server(config)
-        server.run()
+            config = uvicorn.Config(app, host=self.host, port=self.port, log_level="error", log_config=None)
+            server = uvicorn.Server(config)
+            server.run()
+        except Exception as e:
+            logger.exception(f"[Web] Server thread crashed: {e}")
 
 class ExternalWSServerThread(threading.Thread):
     def __init__(self, controller, loop, host, port):

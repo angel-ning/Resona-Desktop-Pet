@@ -1,0 +1,25 @@
+{
+  "pack_info": {
+    "id": "resona_operator_v1",
+    "name": "Resona Operator",
+    "description": "Neutral operator pack for the Resona Agent Console.",
+    "version": "0.1.0",
+    "author": "Resona"
+  },
+  "character": {
+    "name": "Resona Operator",
+    "username_default": "user",
+    "tts_language": "zh",
+    "outfits": []
+  },
+  "logic": {
+    "prompts": [
+      {
+        "id": "default",
+        "path": "prompts/character_prompt.txt"
+      }
+    ],
+    "interaction_configs": {}
+  },
+  "audio": {}
+}

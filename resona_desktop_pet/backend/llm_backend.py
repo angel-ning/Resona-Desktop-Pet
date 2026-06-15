@@ -6,6 +6,7 @@ import io
 import logging
 import sys
 import time
+from types import SimpleNamespace
 from typing import Optional, Callable, Any, List, Dict, Tuple
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ from litellm import acompletion
 
 from ..config import ConfigManager
 from .mcp_manager import MCPManager
+from .skill_router import SkillRouteContext, SkillRouter
 
 
 @dataclass
@@ -45,6 +47,30 @@ class LLMResponse:
     thought: str = ""
     raw_response: str = ""
     error: Optional[str] = None
+    tool_results: List[Dict[str, Any]] = field(default_factory=list)
+    confirmation: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class PendingToolContinuation:
+    confirmation_id: str
+    messages: list
+    tool_call_id: str
+    invocation: Any
+    tool_meta: Dict[str, Any]
+    model_name: str
+    model_type: Any
+    api_key: str
+    base_url: str
+    tools: List[Dict[str, Any]]
+    max_tool_rounds: int
+    temperature: float
+    top_p: float
+    max_tokens: int
+    pack_id: Optional[str]
+    original_question: str
+    skill_name: str
+    allowed_tool_names: List[str]
 
 
 @dataclass
@@ -79,7 +105,10 @@ class LLMBackend:
         self.log_path = log_path
         self.history = ConversationHistory(max_rounds=config.max_rounds)
         self._mcp_manager = mcp_manager
+        self._tool_executor = None
+        self._skill_router = SkillRouter()
         self._subagent_results: Dict[str, str] = {}
+        self._pending_tool_confirmations: Dict[str, PendingToolContinuation] = {}
         
         self._memory_manager = None
         if hasattr(config, 'memory_enabled') and config.memory_enabled:
@@ -102,6 +131,15 @@ class LLMBackend:
         
     def set_on_activity_callback(self, callback: Callable[[], None]):
         self._on_activity_callback = callback
+
+    def set_tool_executor(self, executor: Any):
+        self._tool_executor = executor
+
+    def source_allows_tools(self, source: str) -> bool:
+        return source in {"desktop", "agent_console"}
+
+    def source_allows_ocr(self, source: str) -> bool:
+        return source == "desktop"
 
     def set_subagent_result(self, mode: str, report: str):
         self._subagent_results[mode] = report
@@ -317,8 +355,18 @@ class LLMBackend:
         if self.config.enable_ip_context and self._ip_context:
             context_parts.append(f"[User IP: {self._ip_context}]")
 
-        if source == "desktop" and self._mcp_manager and self._mcp_manager.enabled and self._mcp_manager.has_tools():
+        if self.source_allows_tools(source) and self._mcp_manager and self._mcp_manager.enabled and self._mcp_manager.has_tools():
             system_prompt = f"{system_prompt}\n\n{self._get_mcp_system_instruction()}"
+
+        if source == "agent_console":
+            system_prompt = (
+                f"{system_prompt}\n\n"
+                "[Agent Console Mode]\n"
+                "You are operating in a developer-facing agent console. Complete the user's task using the available tools when helpful. "
+                "Do not refuse normal development, inspection, automation, or debugging tasks because of character persona. "
+                "Follow runtime tool policy and ask for user confirmation only through tool calls that require it. "
+                "Return the final answer as valid JSON matching the existing response schema."
+            )
 
         if hasattr(self, '_memory_manager') and self.config.memory_enabled and self.config.memory_force_operation:
             memory_instruction = (
@@ -359,7 +407,9 @@ class LLMBackend:
         if source and source != "desktop" and source != "idle_trigger":
             question_blocks.append(f"[Request Source: {source}]")
 
-        if source != "idle_trigger":
+        if source == "agent_console":
+            question_blocks.append("Note: This is an Agent Console request. Prefer precise progress and concrete results over roleplay.")
+        elif source != "idle_trigger":
             sentence_limit = self.config.ocr_sentence_limit
             if sentence_limit > 0:
                 question_blocks.append(f"Note: Keep your response under {sentence_limit} sentences and maintain your persona.")
@@ -394,6 +444,37 @@ class LLMBackend:
                     return part.get("text", "")
             return ""
         return content if isinstance(content, str) else str(content)
+
+    def _build_skill_history_summary(self, history: Optional[ConversationHistory]) -> str:
+        if not history:
+            return ""
+        summary_parts = []
+        for msg in history.get_messages()[-4:]:
+            role = msg.get("role", "")
+            content = self._extract_text_content(msg.get("content", ""))
+            if content:
+                summary_parts.append(f"{role}: {content[:200]}")
+        return "\n".join(summary_parts)
+
+    def _insert_skill_prompt_prefix(self, messages: List[Dict[str, Any]], prompt_prefix: Optional[str]) -> None:
+        if not prompt_prefix:
+            return
+        if any(msg.get("content") == prompt_prefix for msg in messages):
+            return
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                messages.insert(i, {"role": "user", "content": prompt_prefix})
+                return
+
+    def _tool_names(self, tools: List[Dict[str, Any]]) -> List[str]:
+        return [tool.get("function", {}).get("name", "") for tool in tools if tool.get("function", {}).get("name", "")]
+
+    def _filter_tools_for_skill(self, tools: List[Dict[str, Any]], allowed_tools: List[str]) -> List[Dict[str, Any]]:
+        allowed = set(allowed_tools)
+        return [
+            tool for tool in tools
+            if tool.get("function", {}).get("name", "") in allowed
+        ]
 
     def _normalize_model_name(self, model_type: Any, model_name: str) -> str:
         if not model_name:
@@ -1008,9 +1089,14 @@ class LLMBackend:
         top_p: float = 1.0,
         max_tokens: int = 500,
         pack_id: Optional[str] = None,
-        original_question: str = ""
+        original_question: str = "",
+        skill_name: str = "unknown",
+        allowed_tool_names: Optional[List[str]] = None,
+        session_id: Optional[str] = None
     ) -> LLMResponse:
         attempted_retry = False
+        runtime_allowed_tools = allowed_tool_names if allowed_tool_names is not None else self._tool_names(tools)
+        collected_tool_results: List[Dict[str, Any]] = []
         if max_tool_rounds <= 0:
             return LLMResponse(error="Tool call exceeded max rounds")
             
@@ -1083,7 +1169,61 @@ class LLMBackend:
 
                     try:
                         self._notify_activity()
-                        if tool_meta.get("subagent"):
+                        if self._tool_executor:
+                            invocation = SimpleNamespace(
+                                tool_name=name,
+                                arguments=parsed_args,
+                                skill=skill_name,
+                                source="llm_tool_call",
+                                pack_id=pack_id,
+                                request_id=None,
+                                allowed_tools=runtime_allowed_tools,
+                                metadata={"original_question": original_question},
+                            )
+                            execution = await self._tool_executor.execute(
+                                invocation,
+                                subagent_runner=self._run_subagent,
+                            )
+                            collected_tool_results.append(execution.to_dict())
+                            if execution.requires_confirmation:
+                                confirmation_id = execution.confirmation_id
+                                confirmation_payload = {
+                                    "confirmation_id": confirmation_id,
+                                    "tool_name": name,
+                                    "arguments": parsed_args,
+                                    "policy_reason": execution.policy_reason,
+                                    "skill": skill_name,
+                                    "pack_id": pack_id,
+                                }
+                                if session_id and confirmation_id:
+                                    self._pending_tool_confirmations[session_id] = PendingToolContinuation(
+                                        confirmation_id=confirmation_id,
+                                        messages=messages,
+                                        tool_call_id=call_id or "",
+                                        invocation=invocation,
+                                        tool_meta=tool_meta,
+                                        model_name=model_name,
+                                        model_type=model_type,
+                                        api_key=api_key,
+                                        base_url=base_url,
+                                        tools=tools,
+                                        max_tool_rounds=max_tool_rounds,
+                                        temperature=temperature,
+                                        top_p=top_p,
+                                        max_tokens=max_tokens,
+                                        pack_id=pack_id,
+                                        original_question=original_question,
+                                        skill_name=skill_name,
+                                        allowed_tool_names=runtime_allowed_tools,
+                                    )
+                                return LLMResponse(
+                                    text_display="Tool call requires user confirmation.",
+                                    raw_response="",
+                                    tool_results=collected_tool_results,
+                                    confirmation=confirmation_payload,
+                                )
+                            tool_result = execution.to_tool_message()
+                        elif tool_meta.get("subagent"):
                             logger_info.info(f"[LLM] Delegating '{name}' to SubAgent with question: {original_question}")
                             tool_result = await self._run_subagent(name, original_question, pack_id)
                             logger_info.info(f"[LLM] SubAgent '{name}' finished. Result summary: {tool_result[:200]}...")
@@ -1105,6 +1245,7 @@ class LLMBackend:
             if raw_text:
                 llm_resp = self._parse_response(raw_text)
                 llm_resp.thought = reasoning
+                llm_resp.tool_results = collected_tool_results
                 if not llm_resp.error:
                     return llm_resp
                 if not attempted_retry:
@@ -1124,7 +1265,59 @@ class LLMBackend:
 
         return LLMResponse(error=f"Tool call exceeded max rounds ({max_tool_rounds})")
 
-    async def query(self, question: str, history: Optional[ConversationHistory] = None, extra_context: Optional[str] = None, pack_id: Optional[str] = None, source: str = "desktop") -> LLMResponse:
+    async def confirm_pending_tool(self, session_id: str, confirmation_id: str, approved: bool = True) -> LLMResponse:
+        pending = self._pending_tool_confirmations.get(session_id)
+        if not pending:
+            return LLMResponse(error="No pending tool confirmation for this session.")
+        if pending.confirmation_id != confirmation_id:
+            return LLMResponse(error="Confirmation id does not match the pending tool call.")
+
+        self._pending_tool_confirmations.pop(session_id, None)
+        if not approved:
+            pending.messages.append({
+                "role": "tool",
+                "content": "User rejected this tool call.",
+                "tool_call_id": pending.tool_call_id,
+            })
+            return LLMResponse(
+                text_display="Tool call cancelled.",
+                raw_response='{"emotion":"<E:normal>","text_display":"Tool call cancelled.","text_tts":"","thought":""}',
+            )
+
+        if not self._tool_executor:
+            return LLMResponse(error="Tool executor is not available.")
+
+        execution = await self._tool_executor.execute_confirmed(
+            pending.invocation,
+            subagent_runner=self._run_subagent,
+        )
+        tool_result = execution.to_tool_message()
+        pending.messages.append({
+            "role": "tool",
+            "content": tool_result,
+            "tool_call_id": pending.tool_call_id,
+        })
+        response = await self._query_with_tools(
+            pending.messages,
+            pending.model_name,
+            pending.model_type,
+            pending.api_key,
+            pending.base_url,
+            tools=pending.tools,
+            max_tool_rounds=max(pending.max_tool_rounds - 1, 1),
+            temperature=pending.temperature,
+            top_p=pending.top_p,
+            max_tokens=pending.max_tokens,
+            pack_id=pending.pack_id,
+            original_question=pending.original_question,
+            skill_name=pending.skill_name,
+            allowed_tool_names=pending.allowed_tool_names,
+            session_id=session_id,
+        )
+        response.tool_results.insert(0, execution.to_dict())
+        return response
+
+    async def query(self, question: str, history: Optional[ConversationHistory] = None, extra_context: Optional[str] = None, pack_id: Optional[str] = None, source: str = "desktop", session_id: Optional[str] = None) -> LLMResponse:
         llm_config = self.config.get_llm_config()
         model_type = llm_config["model_type"]
         model_name = llm_config["model_name"]
@@ -1136,11 +1329,14 @@ class LLMBackend:
             self.reconnect()
 
         try:
+            if session_id and session_id in self._pending_tool_confirmations:
+                return LLMResponse(error="A tool call is awaiting confirmation. Confirm or reject it before sending a new task.")
+
             ocr_config = self.config.get_ocr_config()
             ocr_context = None
             image_base64 = None
             
-            if source == "desktop":
+            if self.source_allows_ocr(source):
                 ocr_context = await self._get_ocr_context(ocr_config)
                 vlm_enabled = ocr_config.get("vlm_enabled", False)
                 if vlm_enabled:
@@ -1161,11 +1357,39 @@ class LLMBackend:
             else:
                 messages = self._build_messages(question, extra_context or ocr_context, history, pack_id=pack_id, source=source)
             processed_question = self._extract_text_content(messages[-1]["content"])
+            skill_route = None
+            skill_router_enabled = getattr(self.config, "skill_router_enabled", True)
+            if skill_router_enabled:
+                target_history = history if history is not None else self.history
+                skill_route = self._skill_router.route(
+                    question,
+                    SkillRouteContext(
+                        source=source,
+                        pack_id=pack_id,
+                        history_summary=self._build_skill_history_summary(target_history),
+                        extra_context=extra_context,
+                        ocr_context=ocr_context,
+                    )
+                )
+                query_preview = question.replace("\n", " ")[:200]
+                logger_info.info(f"[SkillRouter] input query: {query_preview}")
+                logger_info.info(f"[SkillRouter] selected skill: {skill_route.skill.name}")
+                logger_info.info(f"[SkillRouter] reason: {skill_route.reason}")
+                logger_info.info(f"[SkillRouter] allowed tools: {skill_route.skill.allowed_tools}")
+                self._insert_skill_prompt_prefix(messages, skill_route.skill.prompt_prefix)
+            else:
+                logger_info.info("[SkillRouter] disabled; preserving full public MCP tool visibility.")
+
             tools: List[Dict[str, Any]] = []
             max_tool_rounds = 0
-            if source == "desktop" and self._mcp_manager and self._mcp_manager.enabled and self._mcp_manager.has_tools():
+            if self.source_allows_tools(source) and self._mcp_manager and self._mcp_manager.enabled and self._mcp_manager.has_tools():
                 tools = self._mcp_manager.get_tools(public_only=True)
                 max_tool_rounds = max(self._mcp_manager.max_tool_rounds, 0)
+                before_count = len(tools)
+                if skill_router_enabled and skill_route:
+                    tools = self._filter_tools_for_skill(tools, skill_route.skill.allowed_tools)
+                    logger_info.info(f"[SkillRouter] tool count before={before_count} after={len(tools)}")
+                logger_info.info(f"[SkillRouter] final tools passed to LLM: {self._tool_names(tools)}")
             prompt_parts = []
             if self.config.enable_time_context:
                 prompt_parts.append("time")
@@ -1200,7 +1424,10 @@ class LLMBackend:
                         top_p=llm_config.get("top_p", 1.0),
                         max_tokens=llm_config.get("max_tokens", 500),
                         pack_id=pack_id,
-                        original_question=question
+                        original_question=question,
+                        skill_name=skill_route.skill.name if skill_route else "unknown",
+                        allowed_tool_names=self._tool_names(tools),
+                        session_id=session_id,
                     )
                 else:
                     response = await self._query_litellm(
@@ -1218,7 +1445,7 @@ class LLMBackend:
         except Exception as e:
             response = LLMResponse(error=f"Request Failed: {e}")
 
-        if not response.error and response.text_display:
+        if not response.error and response.text_display and not response.confirmation:
             target_history = history if history is not None else self.history
             target_history.add("user", processed_question)
             target_history.add("assistant", response.raw_response)
