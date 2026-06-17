@@ -1,0 +1,89 @@
+llm:
+  enabled: false
+  provider: litellm
+  active_model: Model_2_DeepSeek
+  models:
+    Model_1_OpenAI:
+      api_key: ""
+      base_url: https://api.openai.com/v1
+      model_name: ""
+      temperature: 0.95
+      top_p: 1.0
+      max_tokens: 768
+    Model_2_DeepSeek:
+      api_key: ""
+      base_url: https://api.deepseek.com
+      model_name: deepseek-v4-flash
+      temperature: 1.0
+      top_p: 1.0
+      max_tokens: 768
+    Model_3_Claude:
+      api_key: ""
+      base_url: https://api.anthropic.com
+      model_name: ""
+      temperature: 0.95
+      top_p: 1.0
+      max_tokens: 768
+    Model_4_Kimi:
+      api_key: ""
+      base_url: https://api.moonshot.cn/v1
+      model_name: ""
+      temperature: 0.95
+      top_p: 1.0
+      max_tokens: 768
+    Model_5_Gemini:
+      api_key: ""
+      base_url: https://generativelanguage.googleapis.com
+      model_name: ""
+      temperature: 1.0
+      top_p: 1.0
+      max_tokens: 768
+    Model_6_Grok:
+      api_key: ""
+      base_url: https://api.x.ai/v1
+      model_name: ""
+      temperature: 0.95
+      top_p: 1.0
+      max_tokens: 768
+    Model_7_Qwen:
+      api_key: ""
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      model_name: ""
+      temperature: 0.95
+      top_p: 1.0
+      max_tokens: 768
+    Model_8_GitHub:
+      api_key: ""
+      base_url: https://models.inference.ai.azure.com/chat/completions
+      model_name: ""
+      temperature: 0.95
+      top_p: 1.0
+      max_tokens: 768
+    Model_9_OpenAI_Compatible:
+      api_key: ""
+      base_url: ""
+      model_name: ""
+      temperature: 0.95
+      top_p: 1.0
+      max_tokens: 768
+    Model_10_Zhipu:
+      api_key: ""
+      base_url: https://open.bigmodel.cn/api/paas/v4/
+      model_name: glm-4-flash
+      temperature: 0.95
+      top_p: 1.0
+      max_tokens: 768
+    Model_Local:
+      api_key: ollama
+      base_url: http://localhost:11434/v1
+      model_name: ""
+      temperature: 0.95
+      top_p: 1.0
+      max_tokens: 768
+
+runtime:
+  default_agent_id: default_assistant
+  enable_cards: true
+
+logging:
+  level: INFO

@@ -1,0 +1,7 @@
+id: roleplay_companion
+name: Roleplay Companion
+description: Character-oriented conversational agent profile.
+enabled: true
+triggers: []
+tools: []
+permissions: []

@@ -22,6 +22,11 @@ wheels/
 *.egg
 
 # =========================
+# Personal Agent OS Local Config
+# =========================
+config/agent_os.yaml
+
+# =========================
 # Virtual Environment
 # =========================
 venv/
@@ -143,6 +148,9 @@ resona_tts_*/
 # Minecraft Runtime Data
 **/mods/
 **/config/
+!config/
+config/*
+!config/agent_os.example.yaml
 **/resourcepacks/
 **/saves/
 **/screenshots/
@@ -211,3 +219,8 @@ android-client/**/*.apk
 android-client/**/*.aab
 android-client/**/*.iml
 android-client/*.keystore
+
+
+runtime
+frontend
+models

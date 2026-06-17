@@ -1,0 +1,7 @@
+id: default_assistant
+name: Default Assistant
+description: General purpose Personal Agent OS assistant.
+enabled: true
+triggers: []
+tools: []
+permissions: []
